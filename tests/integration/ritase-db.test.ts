@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
+// Integration tests intentionally exercise the PostgreSQL business rules directly.
 const databaseUrl = process.env.DATABASE_URL
 
 if (!databaseUrl) {
