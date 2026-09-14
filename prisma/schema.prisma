@@ -1,0 +1,412 @@
+// Skema database ERP-VTI — mengikuti Dokumen Master Bagian 12 (Model Data).
+// Provider: PostgreSQL (Neon untuk pilot; kompatibel dengan Postgres self-hosted nanti).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled (Supavisor transaction mode, port 6543, ?pgbouncer=true)
+  directUrl = env("DIRECT_URL")   // koneksi langsung/session (port 5432) — dipakai prisma migrate
+}
+
+// ============ ENTITAS MASTER ============
+
+model Vendor {
+  id             String   @id @default(cuid())
+  nama           String
+  peran          String   // "Hauling & Barging" | "Perawatan Jalan (MRR)" | "Internal"
+  hargaPerRitase Int      @default(0) // Rp — PLACEHOLDER, wajib verifikasi (lembar verifikasi B1-B4)
+  units          Unit[]
+  drivers        Driver[]
+  ritase         Ritase[]
+  createdAt      DateTime @default(now())
+}
+
+model Unit {
+  id             String            @id // kode unit, mis. EXC-001
+  nama           String
+  tipe           String            // PC200 | PC300 | DT | WL | BZR
+  kategori       String            // Excavator | Dump Truck | Wheel Loader | Bulldozer
+  bucketM3       Float             @default(0) // volume sendok excavator (m3); 0 untuk non-excavator
+  kapasitasM3    Float             @default(0) // volume vessel dump truck (m3) — dasar hitung tonase per ritase
+  targetTonBulan Int               @default(0)
+  // Jadwal service berbasis hour meter (Notulensi topik 3).
+  // 250 jam = ILUSTRATIF, verifikasi di pertemuan divisi Engineering.
+  serviceIntervalJam Int           @default(250)
+  hmService      Float             @default(0) // posisi HM saat service terakhir
+  serviceTerakhir DateTime?
+  vendor         Vendor            @relation(fields: [vendorId], references: [id])
+  vendorId       String
+  ritase         Ritase[]
+  kejadian       KejadianOperasi[]
+  catatanHM      CatatanHM[]
+  catatanBBM     CatatanBBM[]
+  createdAt      DateTime          @default(now())
+}
+
+/// Pembacaan hour meter per unit per hari (Notulensi topik 3) — bahan bakar
+/// papan service. HM tidak boleh turun antar tanggal; ditegakkan trigger.
+model CatatanHM {
+  id          String   @id @default(cuid())
+  unit        Unit     @relation(fields: [unitId], references: [id])
+  unitId      String
+  tanggal     DateTime @db.Date
+  hm          Float
+  dicatatOleh String // nama user dari sesi login
+  createdAt   DateTime @default(now())
+
+  // Satu pembacaan per unit per hari; input ulang = koreksi (upsert).
+  @@unique([unitId, tanggal])
+}
+
+model Driver {
+  id        String   @id @default(cuid())
+  nama      String
+  vendor    Vendor   @relation(fields: [vendorId], references: [id])
+  vendorId  String
+  ritase    Ritase[]
+  createdAt DateTime @default(now())
+}
+
+model Material {
+  id           String   @id // mis. mat-sap
+  nama         String
+  density      Float    // t/m3 — ditetapkan owner, wajib verifikasi
+  kadarDefault Float
+  ritase       Ritase[]
+}
+
+model Stockpile {
+  id        String          @id // mis. sp-eto1
+  kode      String          // ETO-1, EBO-2, ...
+  kadar     Float // diperbarui otomatis dari hasil sampel lab SELESAI (sumber kebenaran kadar)
+  diAtasCOG Boolean
+  movements StockMovement[]
+  shipments Shipment[]
+  ritase    Ritase[]
+  sampel    SampelLab[]
+}
+
+// ============ LABORATORIUM (Notulensi topik 7) ============
+
+enum SampelStatus {
+  DITERIMA
+  PREPARASI
+  ANALISIS
+  SELESAI
+}
+
+/// Alur sampel lab: masuk → preparasi → analisis → hasil. Menggantikan
+/// pelaporan manual via WhatsApp. Sampel SELESAI wajib punya kadar (CHECK)
+/// dan terkunci (trigger) — hasilnya dipakai Produksi & menentukan posisi
+/// stockpile terhadap COG, jadi tidak boleh berubah diam-diam.
+model SampelLab {
+  id             String       @id @default(cuid())
+  kode           String       @unique // mis. SMP-20260811-001
+  tanggal        DateTime     @db.Date
+  asal           String // titik ambil: pit / front / stockpile
+  stockpile      Stockpile?   @relation(fields: [stockpileId], references: [id])
+  stockpileId    String? // bila terisi, hasil SELESAI memperbarui kadar stockpile ini
+  status         SampelStatus @default(DITERIMA)
+  kadarNi        Float? // % Ni hasil analisis
+  mc             Float? // moisture content %
+  keterangan     String?
+  diterimaOleh   String
+  dianalisisOleh String?
+  selesaiPada    DateTime?
+  createdAt      DateTime     @default(now())
+}
+
+model Tongkang {
+  id        String     @id
+  nama      String
+  kapasitas Int        // ton
+  shipments Shipment[]
+}
+
+// ============ ENTITAS TRANSAKSI ============
+
+enum RitaseStatus {
+  MENUNGGU
+  DISETUJUI
+  DITOLAK
+}
+
+/// Satu baris = SATU ritase (satu kali bolak-balik pit -> stockpile).
+/// Tonase melekat di sini (FSD-002): terisi otomatis saat driver input,
+/// ikut divalidasi berjenjang, dan baru sah setelah tahap checker (BRULE-005).
+model Ritase {
+  id             String         @id @default(cuid())
+  tanggal        DateTime
+  unit           Unit           @relation(fields: [unitId], references: [id])
+  unitId         String         // dump truck pengangkut
+  driver         Driver         @relation(fields: [driverId], references: [id])
+  driverId       String
+  vendor         Vendor         @relation(fields: [vendorId], references: [id])
+  vendorId       String
+  material       Material       @relation(fields: [materialId], references: [id])
+  materialId     String
+  asal           String         // pit asal
+  stockpile      Stockpile      @relation(fields: [stockpileId], references: [id])
+  stockpileId    String         // stockpile tujuan
+  kapasitasM3    Float          // snapshot vessel DT
+  density        Float          // snapshot density material
+  tonase         Float          // kapasitasM3 x density (BRULE-002, dihitung server)
+  kadar          Float          // snapshot kadar material
+  hargaPerRitase Int            // snapshot harga saat entry (kontrak bisa berubah)
+  nilai          Int            // = hargaPerRitase (1 baris = 1 ritase)
+  // 0=driver, 1=pengawas, 2=checker, 3=lolos semua.
+  // Ritase baru dibuat dengan tahapIndex 1: tahap driver selesai oleh input itu
+  // sendiri (FSD-003), sehingga indeks 0 hanya ada pada data lama.
+  tahapIndex     Int            @default(1)
+  status         RitaseStatus   @default(MENUNGGU)
+  catatanTolak   String?
+  audit          AuditLog[]
+  movement       StockMovement? // pergerakan stok MASUK, dibuat otomatis saat tervalidasi penuh
+  createdAt      DateTime       @default(now())
+}
+
+enum MovementJenis {
+  MASUK
+  KELUAR
+}
+
+model StockMovement {
+  id          String        @id @default(cuid())
+  tanggal     DateTime
+  stockpile   Stockpile     @relation(fields: [stockpileId], references: [id])
+  stockpileId String
+  jenis       MovementJenis
+  tonase      Float
+  sumber      String        // "Hauling Pit A" / "Barging BG-01"
+  shipment    Shipment?     @relation(fields: [shipmentId], references: [id])
+  shipmentId  String?
+  ritase      Ritase?       @relation(fields: [ritaseId], references: [id])
+  ritaseId    String?       @unique // satu ritase tervalidasi -> satu movement MASUK
+  createdAt   DateTime      @default(now())
+}
+
+enum ShipmentStatus {
+  DIMUAT
+  SURVEI
+  TERJUAL
+}
+
+model Shipment {
+  id             String          @id @default(cuid())
+  tanggal        DateTime
+  tongkang       Tongkang        @relation(fields: [tongkangId], references: [id])
+  tongkangId     String
+  stockpile      Stockpile       @relation(fields: [stockpileId], references: [id])
+  stockpileId    String
+  kadar          Float
+  tonaseEstimasi Float           // titik ukur 1: perkiraan di tambang
+  tonaseSurvei   Float?          // titik ukur 2: survei stockpile
+  tonaseFinal    Float?          // titik ukur 3: independent/draft survey -> dasar bayar (BR-4)
+  hargaJual      Int?            // Rp/ton
+  pendapatan     BigInt?         // tonaseFinal x hargaJual
+  status         ShipmentStatus  @default(DIMUAT)
+  movements      StockMovement[]
+  createdAt      DateTime        @default(now())
+}
+
+// ============ RENCANA & KEJADIAN OPERASI (Form D Produksi) ============
+
+/// Target produksi harian — dasar "plan vs actual" (Form D 3.x & 8.2).
+/// Satu baris per tanggal; input ulang tanggal yang sama = perbarui target (upsert).
+model RencanaHarian {
+  id         String   @id @default(cuid())
+  tanggal    DateTime @unique
+  targetTon  Float
+  catatan    String?
+  dibuatOleh String   // nama user dari sesi login
+  createdAt  DateTime @default(now())
+}
+
+enum PeriodeRencana {
+  BULANAN
+  TAHUNAN
+}
+
+/// Target produksi bulanan/tahunan — pelengkap RencanaHarian.
+/// Format periode ditegakkan CHECK database: BULANAN "2026-08", TAHUNAN "2026".
+model RencanaPeriode {
+  id         String         @id @default(cuid())
+  tipe       PeriodeRencana
+  periode    String
+  targetTon  Float
+  catatan    String?
+  dibuatOleh String
+  createdAt  DateTime       @default(now())
+
+  @@unique([tipe, periode])
+}
+
+/// Pemakaian BBM harian per unit — bahan pembanding Dashboard Master
+/// (BBM vs ritase, BBM vs tonase) & kelak analisis biaya per ton.
+model CatatanBBM {
+  id          String   @id @default(cuid())
+  unit        Unit     @relation(fields: [unitId], references: [id])
+  unitId      String
+  tanggal     DateTime @db.Date
+  liter       Float
+  dicatatOleh String
+  createdAt   DateTime @default(now())
+
+  @@unique([unitId, tanggal])
+}
+
+/// Foto profil pengguna — atribut, bukan bukti: satu per pengguna, boleh
+/// diganti kapan saja. Disimpan di database (kecil, ≤512KB setelah resize
+/// klien) agar tidak butuh bucket storage terpisah.
+model ProfilFoto {
+  penggunaId String   @id // Supabase Auth user id
+  mime       String
+  data       Bytes
+  diperbarui DateTime @default(now())
+}
+
+// ============ SURAT IZIN (presensi -> HR) ============
+
+enum JenisIzin {
+  IZIN
+  SAKIT
+  CUTI
+}
+
+enum StatusIzin {
+  MENUNGGU
+  DISETUJUI
+  DITOLAK
+}
+
+/// Surat izin/sakit/cuti — diajukan pegawai dari halaman Presensi,
+/// diproses HR/owner lewat menu HR "Permohonan Cuti". Lampiran = foto
+/// surat (mis. surat dokter), disimpan di DB seperti foto profil.
+/// Sekali diproses terkunci (trigger) — keputusan HR bukan draft.
+model SuratIzin {
+  id           String     @id @default(cuid())
+  penggunaId   String // Supabase Auth user id
+  penggunaNama String
+  penggunaRole String
+  jenis        JenisIzin
+  dari         DateTime   @db.Date
+  sampai       DateTime   @db.Date
+  alasan       String
+  lampiranMime String?
+  lampiranData Bytes?
+  status       StatusIzin @default(MENUNGGU)
+  catatanHr    String?
+  diprosesOleh String?
+  diprosesPada DateTime?
+  createdAt    DateTime   @default(now())
+
+  @@index([penggunaId])
+  @@index([status])
+}
+
+// ============ LAHAN & REKLAMASI (arahan owner) ============
+
+enum TahapLahan {
+  SURVEY
+  PEMETAAN
+  PENAMBANGAN
+  REKLAMASI
+  SELESAI
+}
+
+/// Siklus hidup lahan: survey geolokasi → pemetaan drone → ditambang →
+/// reklamasi. Tiap kemajuan tahap tercatat di TahapanLahan (siapa, kapan,
+/// catatan, tautan dokumen hasil survey/drone).
+model Lahan {
+  id         String       @id @default(cuid())
+  nama       String
+  lokasi     String // deskripsi lokasi / desa / blok
+  lat        Float?
+  lon        Float?
+  luasHa     Float?
+  status     TahapLahan   @default(SURVEY)
+  keterangan String?
+  dibuatOleh String
+  tahapan    TahapanLahan[]
+  createdAt  DateTime     @default(now())
+}
+
+model TahapanLahan {
+  id         String     @id @default(cuid())
+  lahan      Lahan      @relation(fields: [lahanId], references: [id])
+  lahanId    String
+  tahap      TahapLahan
+  catatan    String?
+  dokumenUrl String? // tautan hasil survey / citra drone (Drive dsb.)
+  oleh       String
+  waktu      DateTime   @default(now())
+}
+
+enum JenisKejadian {
+  BREAKDOWN // unit rusak (BD) — lawan dari RFU
+  STANDBY   // unit siap tapi menganggur (tunggu front/alat muat/operator)
+  HUJAN
+  SLIPPERY
+  LAINNYA
+}
+
+/// Log kejadian operasi & aktivitas unit (Form D 8.2/8.4: RFU/BD/standby,
+/// hujan/slippery, kode kendala baku). unitId kosong = kejadian area
+/// (hujan menghentikan front, bukan satu unit). jamSelesai kosong = masih
+/// berlangsung; unit tanpa kejadian aktif dianggap RFU.
+model KejadianOperasi {
+  id          String        @id @default(cuid())
+  tanggal     DateTime
+  jenis       JenisKejadian
+  unit        Unit?         @relation(fields: [unitId], references: [id])
+  unitId      String?
+  jamMulai    String        // "07:30" — jam lokal site
+  jamSelesai  String?
+  keterangan  String?
+  dicatatOleh String        // nama user dari sesi login
+  createdAt   DateTime      @default(now())
+}
+
+// ============ PRESENSI (modul HR — dari draga) ============
+
+/// Kehadiran harian. Satu baris per pengguna per tanggal kerja (zona
+/// Asia/Makassar). Jam diisi database (now()), TIDAK PERNAH dari klien —
+/// presensi dasar penggajian, jam perangkat bisa diatur pemiliknya.
+/// Identitas dari Supabase Auth; nama & role di-snapshot saat absen.
+model Presensi {
+  id           String    @id @default(cuid())
+  penggunaId   String // Supabase Auth user id
+  penggunaNama String
+  penggunaRole String
+  tanggal      DateTime  @db.Date
+  jamMasuk     DateTime  @default(now()) @db.Timestamptz(6)
+  jamPulang    DateTime? @db.Timestamptz(6)
+  // Koordinat saat absen bila perangkat memberikannya (Notulensi topik 10).
+  // Opsional: GPS terhalang di workshop tidak boleh menghalangi absen.
+  latMasuk     Float?
+  lonMasuk     Float?
+  latPulang    Float?
+  lonPulang    Float?
+  catatan      String?
+  createdAt    DateTime  @default(now())
+
+  // Satu baris per orang per hari — absen kedua bukan galat, kembalikan yang ada.
+  @@unique([penggunaId, tanggal])
+  @@index([tanggal])
+}
+
+// ============ AUDIT / VALIDASI LOG (FR-6) ============
+
+model AuditLog {
+  id       String   @id @default(cuid())
+  ritase   Ritase   @relation(fields: [ritaseId], references: [id])
+  ritaseId String
+  aksi     String   // buat | setuju | tolak
+  peran    String   // Driver | Pengawas | Checker
+  oleh     String   // nama user dari sesi login
+  sumber   String   @default("web") // web | asisten | telegram — lewat mana aksi dilakukan
+  waktu    DateTime @default(now())
+}
