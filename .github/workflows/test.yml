@@ -5,8 +5,28 @@ on:
   pull_request:
 
 jobs:
-  unit-and-smoke:
+  unit-and-integration:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: vti_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d vti_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/vti_test
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/vti_test
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,7 +38,16 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
-      - name: Run tests
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Enable PostgreSQL crypto extension
+        run: psql "$DIRECT_URL" -c 'CREATE EXTENSION IF NOT EXISTS pgcrypto;'
+
+      - name: Apply database migrations
+        run: npx prisma migrate deploy
+
+      - name: Run automated tests
         run: npm test
